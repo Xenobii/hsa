@@ -1,0 +1,28 @@
+corpus:
+  corpus_file: corpus/corpus.h5
+  root: corpus/dataset/maestro
+
+model:
+  _target_: model.hsa.HSA
+
+dataloader:
+  _target_: torch.utils.data.DataLoader
+  batch_size: ${train.batch_size}
+  shuffle: ${train.shuffle}
+  num_workers: ${train.num_workers}
+
+train:
+  epochs: 4
+  batch_size: 8
+  shuffle: True
+  num_workers: 0
+
+optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-3
+
+torch:
+  seed: 42
+  cudnn_benchmark: True
+  cudnn_deterministic: False
+  allow_tf_32: True

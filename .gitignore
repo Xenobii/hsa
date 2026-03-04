@@ -1,0 +1,8 @@
+__pycache__/
+datasets/
+corpus/
+test/
+checkpoints/
+outputs/
+multirun/
+.vscode/
