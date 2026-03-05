@@ -12,14 +12,18 @@ dataloader:
   num_workers: ${train.num_workers}
 
 train:
-  epochs: 4
-  batch_size: 4
+  epochs: 12
+  batch_size: 6
   shuffle: True
   num_workers: 2
+  warmup_steps: 200
 
 optimizer:
   _target_: torch.optim.Adam
-  lr: 1e-3
+  lr: 4e-4
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.LambdaLR
 
 torch:
   seed: 42

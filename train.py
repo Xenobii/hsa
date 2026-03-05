@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data import Dataset 
 import h5py
 from typing import Tuple
-
+import math
 import torch
 import torch.nn as nn
 
@@ -63,17 +63,29 @@ def save_run(model: nn.Module, loss: dict, epoch: int) -> None:
     print(f"Checkpoint saved successfully at {epoch_dir}")
 
 
+def get_lr_lambda(warmup_steps: int, total_steps: int):
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        else:
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+    return lr_lambda
+
+
 def train(
         model: nn.Module,
         dataloader_train: DataLoader,
         dataloader_valid: DataLoader,
         optimizer: torch.optim.Optimizer, 
-        num_epochs: int
+        scheduler: torch.optim.lr_scheduler._LRScheduler,
+        num_epochs: int,
     ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     print(f"Using device: {device}")
-
+    
+    global_step = 0
     for epoch in range(num_epochs):
         # --- train ---
         model.train()
@@ -87,17 +99,26 @@ def train(
             spec = spec.to(device)
             B = spec.size(0)
 
+            # init
             optimizer.zero_grad(set_to_none=True)
 
+            # forward
             loss = model.forward_train(spec)
 
+            # backward
             loss.backward()
 
-            optimizer.step()
+            # clip norm
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
+            # step
+            optimizer.step()
+            scheduler.step()
+            global_step += 1
+            
             n_train += B
             train_loss += loss.detach().item() * B
-            loop_train.set_postfix(train_loss=train_loss/n_train)
+            loop_train.set_postfix(train_loss=train_loss/n_train, lr=f"{scheduler.get_last_lr()[0]:.2e}")
 
         # --- valid ---
         model.eval()
@@ -124,8 +145,9 @@ def train(
         print(f"Epoch {epoch+1}/{num_epochs}")
         print(f"Train_loss={avg_train_loss:.4f}")
         print(f"Valid_loss={avg_valid_loss:.4f}")
+        print(f"lr={scheduler.get_last_lr()[0]:.2e}")
 
-        # --- put in the fridge ---
+        # --- save ---
         loss = dict(
             train_loss=avg_train_loss,
             valid_loss=avg_valid_loss,
@@ -170,8 +192,15 @@ def main(cfg: DictConfig):
     # --- optimizer ---
     optimizer = instantiate(cfg.optimizer, params=model.parameters())
 
+    # --- scheduler ---
+    num_epochs = cfg.train.epochs
+    warmup_steps = cfg.train.warmup_steps
+    total_steps = num_epochs * len(dataloader_train)
+    lr_lambda = get_lr_lambda(warmup_steps, total_steps)
+    scheduler = instantiate(cfg.scheduler, optimizer, lr_lambda)
+
     # -- train ---
-    train(model, dataloader_train, dataloader_valid, optimizer, cfg.train.epochs)
+    train(model, dataloader_train, dataloader_valid, optimizer, scheduler, cfg.train.epochs)
 
 
 if __name__ == "__main__":
