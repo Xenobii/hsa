@@ -13,8 +13,6 @@ import math
 import torch
 import torch.nn as nn
 
-from model.hsa import HSA
-
 
 
 class Corpus(Dataset):
@@ -186,7 +184,7 @@ def main(cfg: DictConfig):
     dataloader_valid = instantiate(cfg.dataloader, dataset=corpus_valid, collate_fn=collate_fn)
 
     # --- model ---
-    model = HSA()
+    model = instantiate(cfg.model)
     model.print_num_params()
 
     # --- optimizer ---
