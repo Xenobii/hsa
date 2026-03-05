@@ -3,9 +3,8 @@ import torch.nn as nn
 import torchaudio
 import torch.nn.functional as func
 
-from model.utils import plot_spec
 
-
+# === MODEL ===
 class HSA(nn.Module):
     def __init__(
             self,
@@ -108,7 +107,8 @@ class HSA(nn.Module):
     
 
     def _chunk_spec(self, spec: torch.Tensor) -> torch.Tensor:
-        F, L = spec.shape
+        # spec (F, L)
+        L = spec.shape[1]
         T = self.T
         
         # pad full spec
@@ -130,7 +130,9 @@ class HSA(nn.Module):
             chunked_spec = self.preprocess_input(wav_file) # (B, T+2P, F)
 
             # forward
-            return self.forward(chunked_spec)[1] # (B, T, F)
+            rec_a, rec_b, masks_a, masks_b = self.forward(chunked_spec) # (B, T, F)
+
+        return rec_a, rec_b, masks_a, masks_b
             
 
     def sequential_inference(self, wav_file: str) -> None:
@@ -138,15 +140,26 @@ class HSA(nn.Module):
             # preprocess
             chunked_spec = self.preprocess_input(wav_file) # (B, T+2P, F)
 
+            rec_a_sequence = []
+            rec_b_sequence = []
+            masks_a_sequence = []
+            masks_b_sequence = []
+
             # forward
-            spec_rec_sequence = []
             num_chunks = chunked_spec.shape[0]
             for i in range(num_chunks):
-                spec_rec = self.forward(chunked_spec[i, :, :].unsqueeze(0))[1] # (1, T, F)
-                spec_rec_sequence.append(spec_rec)
-            chunked_spec_rec = torch.cat(spec_rec_sequence, dim=0) # (B, T, F)
+                rec_a, rec_b, masks_a, masks_b = self.forward(chunked_spec[i, :, :].unsqueeze(0))
+                rec_a_sequence.append(rec_a)
+                rec_b_sequence.append(rec_b)
+                masks_a_sequence.append(masks_a)
+                masks_b_sequence.append(masks_b)
+                
+            rec_a = torch.cat(rec_a_sequence, dim=0) # (B, T, F)
+            rec_b = torch.cat(rec_b_sequence, dim=0) # (B, T, F)
+            masks_a = torch.cat(masks_a_sequence, dim=0) # (B, K, T, F)
+            masks_b = torch.cat(masks_b_sequence, dim=0) # (B, K, T, F)
 
-        return chunked_spec_rec
+        return rec_a, rec_b, masks_a, masks_b
     
 
     def reconstruction_loss(self, estimate: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -165,7 +178,7 @@ class HSA(nn.Module):
 
     def forward_train(self, chunked_spec: torch.Tensor) -> None:
         # chunked_spec: (B, T+2P, F)
-        reconstruction_a, reconstruction_b = self.forward(chunked_spec) # (B, T, F)
+        reconstruction_a, reconstruction_b, _, _ = self.forward(chunked_spec) # (B, T, F)
         loss_a = self.reconstruction_loss(reconstruction_a, chunked_spec)
         loss_b = self.reconstruction_loss(reconstruction_b, chunked_spec)
         return self.weight_a*loss_a + self.weight_b*loss_b
@@ -221,18 +234,17 @@ class HSA(nn.Module):
         masks_rec_b = output_b[:, :, 1, :, :] # (B, K, T, F)
         masks_rec_b = func.softmax(masks_rec_b, dim=1) # (B, K, T, F)
         reconstruction_b = torch.sum(masks_rec_b * specs_rec_b, dim=1) # (B, T, F)
-
-        return reconstruction_a, reconstruction_b
-
+        
+        return reconstruction_a, reconstruction_b, masks_rec_a, masks_rec_b
+    
 
     def print_num_params(self) -> None:
         names = [
-            ("conv", getattr(self, "conv", None)),
-            ("tok_emb_freq", getattr(self, "tok_emb_freq", None)),
-            ("encoder", getattr(self, "encoder", None)),
-            ("slot_attention_encoder", getattr(self, "slot_attention_encoder", None)),
-            ("rec_dec", getattr(self, "rec_dec", None)),
-            ("cnn_smooth", getattr(self, "cnn_smooth", None)),
+            ("Pre-encoder", getattr(self, "tok_emb_freq", None)),
+            ("Spectral Self Attention", getattr(self, "encoder", None)),
+            ("Slot Attention", getattr(self, "slot_attention_encoder", None)),
+            ("Temporal Self Attention", getattr(self, "self_attention_time", None)),
+            ("Decoder", getattr(self, "rec_dec", None)),
         ]
 
         total = 0
@@ -241,11 +253,134 @@ class HSA(nn.Module):
                 continue
             cnt = sum(p.numel() for p in module.parameters())
             print(f"{name:30s}: {cnt:,}")
-            total += cnt
+
+        total = sum(p.numel() for p in self.parameters())
         print(f"{'TOTAL':30s}: {total:,}")
 
 
+# === MAIN MODULES ===
+class Encoder(nn.Module):
+    def __init__(
+            self,
+            F: int,
+            D: int,
+            dropout: float
+    ) -> None:
+        super().__init__()
 
+        # --- positional embedding ---
+        self.pos_embedding = nn.Embedding(F, D)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        # --- self attention ---
+        self.selfattn1 = SelfAttentionEncoderBlock(D, 4, 512, 0.1)
+        self.selfattn2 = SelfAttentionEncoderBlock(D, 4, 512, 0.1)
+        self.selfattn3 = SelfAttentionEncoderBlock(D, 4, 512, 0.1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # (B, F, D)
+        B, F, D = x.shape
+        device = x.device
+
+        # positional embedding
+        pos = torch.arange(0, F).unsqueeze(0).repeat(B, 1).to(device) # (B, F)
+        scale = torch.sqrt(torch.FloatTensor([D])).to(device)
+        x = self.dropout((x * scale) + self.pos_embedding(pos)) # (B*T, F, D)
+
+        # self attention
+        x = self.selfattn1(x)
+        x = self.selfattn2(x)
+        x = self.selfattn3(x) # (B, F, D)
+
+        return x
+
+
+class SlotAttentionEncoder(nn.Module):
+    def __init__(
+            self,
+            D: int,
+            N: int,
+            K: int,
+            n_heads: int,
+            pf_dim: int,
+            dropout: float,
+            num_iter: int = 3
+    ) -> None:
+        super().__init__()
+
+        self.num_iter = num_iter
+        self.N = N
+        self.D = D
+        self.K = K
+        self.n_heads = n_heads
+
+        self.mlp = nn.Sequential(
+            nn.Linear(D, pf_dim),
+            nn.ReLU(),
+            nn.Linear(pf_dim, D)
+        )
+        self.norm = nn.LayerNorm(D)
+
+        self.slot_mu = nn.Parameter(torch.zeros(1, 1, D))
+        self.slot_log_sigma = nn.Parameter(torch.zeros(1, 1, D))
+        nn.init.xavier_uniform_(self.slot_mu)
+        nn.init.xavier_uniform_(self.slot_log_sigma)
+
+        self.slot_attention = MultiHeadSlotAttention(N, D, K, n_heads, dropout, pf_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, N, D)
+        B = x.shape[0]
+
+        # mlp
+        x = self.mlp(self.norm(x)) # (B, N, D)
+
+        # init slots
+        init_slots = torch.empty((B, self.K, self.D), device=x.device).normal_() # (B, K, D)
+        init_slots = self.slot_mu + torch.exp(self.slot_log_sigma) * init_slots
+
+        # slot attention
+        slots, attn, attn_logits = self.slot_attention(x, init_slots)
+
+        return slots, attn, init_slots, attn_logits
+
+
+class ReconstructionDecoder(nn.Module):
+    def __init__(
+            self,
+            F: int,
+            D: int,
+    ) -> None:
+        super().__init__()
+    
+        self.F = F
+        self.pos_embedding = nn.Embedding(F, D)
+
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(D),
+            nn.Linear(D, D),
+            nn.ReLU(),
+            nn.Linear(D, 2),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x : (B, K, D)
+        device = x.device
+
+        x = x.unsqueeze(2).contiguous() # (B, K, 1, D)
+
+        # positional embeddings
+        pos_enc = torch.arange(0, self.F).unsqueeze(0).unsqueeze(0).to(device) # (1, 1, F)
+        pos_emb = self.pos_embedding(pos_enc) # (1, 1, F, D)
+        x = x + pos_emb # (B, K, F, D)
+
+        # decoder
+        x = self.mlp(x) # (B, K, F, 2)
+
+        return x
+
+
+# === HELPER MODULES ===
 class SelfAttentionEncoderBlock(nn.Module):
     def __init__(
             self,
@@ -304,26 +439,6 @@ class CrossAttentionDecoderBlock(nn.Module):
 
         return trg, attention
 
-
-class PositionwiseFeedforwardLayer(nn.Module):
-    def __init__(
-            self,
-            D: int,
-            pf_dim: int,
-            dropout: float
-    ) -> None:
-        super().__init__()
-        
-        self.fc_1 = nn.Linear(D, pf_dim)
-        self.fc_2 = nn.Linear(pf_dim, D)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        # x: (B, N, D)
-        x = self.dropout(torch.relu(self.fc_1(x)))
-        x = self.fc_2(x) # (B, N, D)
-        return x
-    
 
 class MultiHeadAttention(nn.Module):
     def __init__(
@@ -458,124 +573,21 @@ class MultiHeadSlotAttention(nn.Module):
         return slots, attn_vis, attn_logits
 
 
-class SlotAttentionEncoder(nn.Module):
+class PositionwiseFeedforwardLayer(nn.Module):
     def __init__(
             self,
             D: int,
-            N: int,
-            K: int,
-            n_heads: int,
             pf_dim: int,
-            dropout: float,
-            num_iter: int = 3
-    ) -> None:
-        super().__init__()
-
-        self.num_iter = num_iter
-        self.N = N
-        self.D = D
-        self.K = K
-        self.n_heads = n_heads
-
-        self.mlp = nn.Sequential(
-            nn.Linear(D, pf_dim),
-            nn.ReLU(),
-            nn.Linear(pf_dim, D)
-        )
-        self.norm = nn.LayerNorm(D)
-
-        self.slot_mu = nn.Parameter(torch.zeros(1, 1, D))
-        self.slot_log_sigma = nn.Parameter(torch.zeros(1, 1, D))
-        nn.init.xavier_uniform_(self.slot_mu)
-        nn.init.xavier_uniform_(self.slot_log_sigma)
-
-        self.slot_attention = MultiHeadSlotAttention(N, D, K, n_heads, dropout, pf_dim)
-
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, N, D)
-        B = x.shape[0]
-
-        # mlp
-        x = self.mlp(self.norm(x)) # (B, N, D)
-
-        # init slots
-        init_slots = torch.empty((B, self.K, self.D), device=x.device).normal_() # (B, K, D)
-        init_slots = self.slot_mu + torch.exp(self.slot_log_sigma) * init_slots
-
-        # slot attention
-        slots, attn, attn_logits = self.slot_attention(x, init_slots)
-
-        return slots, attn, init_slots, attn_logits
-    
-
-class Encoder(nn.Module):
-    def __init__(
-            self,
-            F: int,
-            D: int,
             dropout: float
     ) -> None:
         super().__init__()
+        
+        self.fc_1 = nn.Linear(D, pf_dim)
+        self.fc_2 = nn.Linear(pf_dim, D)
+        self.dropout = nn.Dropout(dropout)
 
-        # --- positional embedding ---
-        self.pos_embedding = nn.Embedding(F, D)
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-
-        # --- self attention ---
-        self.selfattn1 = SelfAttentionEncoderBlock(D, 4, 512, 0.1)
-        self.selfattn2 = SelfAttentionEncoderBlock(D, 4, 512, 0.1)
-        self.selfattn3 = SelfAttentionEncoderBlock(D, 4, 512, 0.1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # (B, F, D)
-        B, F, D = x.shape
-        device = x.device
-
-        # positional embedding
-        pos = torch.arange(0, F).unsqueeze(0).repeat(B, 1).to(device) # (B, F)
-        scale = torch.sqrt(torch.FloatTensor([D])).to(device)
-        x = self.dropout((x * scale) + self.pos_embedding(pos)) # (B*T, F, D)
-
-        # self attention
-        x = self.selfattn1(x)
-        x = self.selfattn2(x)
-        x = self.selfattn3(x) # (B, F, D)
-
+    def forward(self, x):
+        # x: (B, N, D)
+        x = self.dropout(torch.relu(self.fc_1(x)))
+        x = self.fc_2(x) # (B, N, D)
         return x
-
-
-class ReconstructionDecoder(nn.Module):
-    def __init__(
-            self,
-            F: int,
-            D: int,
-    ) -> None:
-        super().__init__()
-    
-        self.F = F
-        self.pos_embedding = nn.Embedding(F, D)
-
-        self.mlp = nn.Sequential(
-            nn.LayerNorm(D),
-            nn.Linear(D, D),
-            nn.ReLU(),
-            nn.Linear(D, 2),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x : (B, K, D)
-        device = x.device
-
-        x = x.unsqueeze(2).contiguous() # (B, K, 1, D)
-
-        # positional embeddings
-        pos_enc = torch.arange(0, self.F).unsqueeze(0).unsqueeze(0).to(device) # (1, 1, F)
-        pos_emb = self.pos_embedding(pos_enc) # (1, 1, F, D)
-        x = x + pos_emb # (B, K, F, D)
-
-        # decoder
-        x = self.mlp(x) # (B, K, F, 2)
-
-        return x
-

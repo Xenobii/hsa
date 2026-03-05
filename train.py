@@ -47,7 +47,7 @@ class Corpus(Dataset):
 
 
 def save_run(model: nn.Module, loss: dict, epoch: int) -> None:
-    epoch_dir = Path("./checkpoints")
+    epoch_dir = Path("./checkpoints") / f"epoch_{epoch+1}"
     epoch_dir.mkdir(parents=True, exist_ok=True)
 
     out_file_loss = epoch_dir / "loss.json"

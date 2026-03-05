@@ -4,7 +4,20 @@ corpus:
 
 model:
   _target_: model.hsa.HSA
-
+  F: 256
+  P: 32
+  T: 128
+  D: 256
+  K: 8
+  target_sr: 16000
+  fft_bins: 2048
+  window_length: 2048
+  hop_sample: 256
+  pad_mode: constant
+  log_offset: 1e-8
+  weight_a: 0.5
+  weight_b: 0.5
+  
 dataloader:
   _target_: torch.utils.data.DataLoader
   batch_size: ${train.batch_size}

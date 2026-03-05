@@ -2,7 +2,7 @@ import logging
 import hydra
 from omegaconf import DictConfig
 from hydra.utils import instantiate
-from model.utils import plot_spec
+from model.utils import plot_spec, visualize_slots
 from pathlib import Path
 import torch
 
@@ -25,10 +25,12 @@ def inference(cfg: DictConfig):
     model.eval()
 
     # -- inference ---
-    spec_rec = model.sequential_inference("test/test_wav.WAV")    
+    rec_a, rec_b, masks_a, masks_b = model.sequential_inference("test/test_wav.WAV")    
     
     # --- plot ---
-    plot_spec(spec_rec, k=0, save_path="test/tet.png")
+    plot_spec(rec_a, rec_b, k=0, save_path="test/test.png")
+    visualize_slots(rec_a, masks_a, save_path="test/slot_test.png")
+    visualize_slots(rec_b, masks_b, save_path="test/slot_test.png")
     
     print("--- Inference successful! ---")
 
