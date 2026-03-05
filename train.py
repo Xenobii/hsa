@@ -115,7 +115,7 @@ def train(
             optimizer.step()
             scheduler.step()
             global_step += 1
-            
+
             n_train += B
             train_loss += loss.detach().item() * B
             loop_train.set_postfix(train_loss=train_loss/n_train, lr=f"{scheduler.get_last_lr()[0]:.2e}")

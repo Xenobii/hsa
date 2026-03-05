@@ -5,6 +5,7 @@ import torch.nn.functional as func
 
 from model.utils import plot_spec
 
+
 class HSA(nn.Module):
     def __init__(
             self,
@@ -19,9 +20,13 @@ class HSA(nn.Module):
             hop_sample: int = 256,
             pad_mode: str = "constant",
             log_offset: float = 1e-8,
+            weight_a: float = 0.5,
+            weight_b: float = 0.5,
     ) -> None:
         super().__init__()
         self.F = F
+        self.weight_a = weight_a
+        self.weight_b = weight_b
 
         # --- resampler ---
         self.target_sr = target_sr
@@ -62,6 +67,9 @@ class HSA(nn.Module):
         # --- slot attention --- 
         self.K = K
         self.slot_attention_encoder = SlotAttentionEncoder(D, F, K, 4, 512, 0.1)
+
+        # --- self attention across time ---
+        self.self_attention_time = Encoder(T, D, dropout=0.1)
 
         # --- reconstruction decoder ---
         self.rec_dec = ReconstructionDecoder(F, D)
@@ -122,7 +130,7 @@ class HSA(nn.Module):
             chunked_spec = self.preprocess_input(wav_file) # (B, T+2P, F)
 
             # forward
-            return self.forward(chunked_spec) # (B, T, F)
+            return self.forward(chunked_spec)[1] # (B, T, F)
             
 
     def sequential_inference(self, wav_file: str) -> None:
@@ -134,7 +142,7 @@ class HSA(nn.Module):
             spec_rec_sequence = []
             num_chunks = chunked_spec.shape[0]
             for i in range(num_chunks):
-                spec_rec = self.forward(chunked_spec[i, :, :].unsqueeze(0)) # (1, T, F)
+                spec_rec = self.forward(chunked_spec[i, :, :].unsqueeze(0))[1] # (1, T, F)
                 spec_rec_sequence.append(spec_rec)
             chunked_spec_rec = torch.cat(spec_rec_sequence, dim=0) # (B, T, F)
 
@@ -157,14 +165,16 @@ class HSA(nn.Module):
 
     def forward_train(self, chunked_spec: torch.Tensor) -> None:
         # chunked_spec: (B, T+2P, F)
-        chunked_spec_rec = self.forward(chunked_spec) # (B, T, F)
-        return self.reconstruction_loss(chunked_spec_rec, chunked_spec)
+        reconstruction_a, reconstruction_b = self.forward(chunked_spec) # (B, T, F)
+        loss_a = self.reconstruction_loss(reconstruction_a, chunked_spec)
+        loss_b = self.reconstruction_loss(reconstruction_b, chunked_spec)
+        return self.weight_a*loss_a + self.weight_b*loss_b
     
     
     def forward(self, spec: torch.Tensor) -> torch.Tensor:
         # spec: (B, T + 2*P, F)
         B = spec.shape[0]
-        T, F, M, K = self.T, self.F, self.M, self.K        
+        T, F, M, K, D = self.T, self.F, self.M, self.K, self.D
         
         # convert to frames
         x = spec.permute(0, 2, 1).contiguous() # (B, F, T + 2*P)
@@ -182,23 +192,37 @@ class HSA(nn.Module):
         x = self.encoder(x) # (B*T, F, D)
         
         # slot attention encoder
-        slots, _, _, _ = self.slot_attention_encoder(x) # (B*T, K, D)
+        slots_a, _, _, _ = self.slot_attention_encoder(x) # (B*T, K, D)
+
+        # temporal self attention
+        slots_b = slots_a.reshape(B, T, K, D).permute(0, 2, 1, 3).reshape(B*K, T, D) # (B*K, T, D)
+        slots_b = self.self_attention_time(slots_b) # (B*K, T, D)
+        slots_b = slots_b.reshape(B, K, T, D).permute(0, 2, 1, 3).reshape(B*T, K, D) # (B*T, K, D)
 
         # reconstruction decoder
-        output = self.rec_dec(slots) # (B*T, K, F, 2)
+        output_a = self.rec_dec(slots_a) # (B*T, K, F, 2)
+        output_b = self.rec_dec(slots_b) # (N*T, K, F, 2)
 
         # smooth output
-        output = output.reshape(B, T, K, F, 2).permute(0, 2, 4, 3, 1).reshape(B, 2*K, F, T) # (B, K*2, F, T)
-        output = self.cnn_smooth(output) # (B, K*2, F, T)
+        output_a = output_a.reshape(B, T, K, F, 2).permute(0, 2, 4, 3, 1).reshape(B, 2*K, F, T) # (B, K*2, F, T)
+        output_a = self.cnn_smooth(output_a) # (B, K*2, F, T)
+        output_b = output_b.reshape(B, T, K, F, 2).permute(0, 2, 4, 3, 1).reshape(B, 2*K, F, T) # (B, K*2, F, T)
+        output_b = self.cnn_smooth(output_b) # (B, K*2, F, T)
         
         # reconstruction
-        output = output.reshape(B, K, 2, F, T).permute(0, 1, 2, 4, 3) # (B, K, 2, T, F)
-        specs_rec = output[:, :, 0, :, :] # (B, K, T, F) 
-        masks_rec = output[:, :, 1, :, :] # (B, K, T, F)
-        masks_rec = func.softmax(masks_rec, dim=1) # (B, K, T, F)
-        reconstruction = torch.sum(masks_rec * specs_rec, dim=1) # (B, T, F)
+        output_a = output_a.reshape(B, K, 2, F, T).permute(0, 1, 2, 4, 3) # (B, K, 2, T, F)
+        specs_rec_a = output_a[:, :, 0, :, :] # (B, K, T, F) 
+        masks_rec_a = output_a[:, :, 1, :, :] # (B, K, T, F)
+        masks_rec_a = func.softmax(masks_rec_a, dim=1) # (B, K, T, F)
+        reconstruction_a = torch.sum(masks_rec_a * specs_rec_a, dim=1) # (B, T, F)
+        
+        output_b = output_b.reshape(B, K, 2, F, T).permute(0, 1, 2, 4, 3) # (B, K, 2, T, F)
+        specs_rec_b = output_b[:, :, 0, :, :] # (B, K, T, F) 
+        masks_rec_b = output_b[:, :, 1, :, :] # (B, K, T, F)
+        masks_rec_b = func.softmax(masks_rec_b, dim=1) # (B, K, T, F)
+        reconstruction_b = torch.sum(masks_rec_b * specs_rec_b, dim=1) # (B, T, F)
 
-        return reconstruction
+        return reconstruction_a, reconstruction_b
 
 
     def print_num_params(self) -> None:
