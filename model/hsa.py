@@ -152,7 +152,7 @@ class HSA(nn.Module):
         reconstruction_loss = func.mse_loss(estimate, target, reduction="none")
 
         # sum across frequency, mean across time/batch
-        return reconstruction_loss.sum(-1).mean()
+        return reconstruction_loss.mean()
 
 
     def forward_train(self, chunked_spec: torch.Tensor) -> None:
@@ -231,7 +231,8 @@ class SelfAttentionEncoderBlock(nn.Module):
             dropout: float,
     ) -> None:
         super().__init__()
-        self.norm = nn.LayerNorm(D)
+        self.norm1 = nn.LayerNorm(D)
+        self.norm2 = nn.LayerNorm(D)
         self.self_attention = MultiHeadAttention(D, n_heads, dropout)
         self.dropout = nn.Dropout(dropout)
         self.positionwise_feedforward = PositionwiseFeedforwardLayer(D, pf_dim, dropout)
@@ -241,11 +242,11 @@ class SelfAttentionEncoderBlock(nn.Module):
 
         # self attention
         _x, _ = self.self_attention(x, x, x) # (B, N, D)
-        x = self.norm(x + self.dropout(_x)) # (B, N, D)
+        x = self.norm1(x + self.dropout(_x)) # (B, N, D)
 
         # positionwise feedforward
         _x = self.positionwise_feedforward(x) # (B, N, D)
-        x = self.norm(x + self.dropout(_x)) # (B, N, D)
+        x = self.norm2(x + self.dropout(_x)) # (B, N, D)
 
         return x
     
@@ -259,7 +260,8 @@ class CrossAttentionDecoderBlock(nn.Module):
             dropout: float
     ) -> None:
         super().__init__()
-        self.norm = nn.LayerNorm(D)
+        self.norm1 = nn.LayerNorm(D)
+        self.norm2 = nn.LayerNorm(D)
         self.cross_attention = MultiHeadAttention(D, n_heads, dropout)
         self.dropout = nn.Dropout(dropout)
         self.positionwise_feedforward = PositionwiseFeedforwardLayer(D, pf_dim, dropout)
@@ -270,11 +272,11 @@ class CrossAttentionDecoderBlock(nn.Module):
         
         # cross attention
         _trg, attention = self.cross_attention(trg, x, x) # (B, Nkv, D)
-        trg = self.norm(trg + self.dropout(_trg)) # (B, Nkv, D)
+        trg = self.norm1(trg + self.dropout(_trg)) # (B, Nkv, D)
 
         # positionwise feedforward
         _trg = self.positionwise_feedforward(trg) # (B, Nkv, D)
-        trg = self.norm(trg + self.dropout(_trg)) # (B, Nkv, D)
+        trg = self.norm2(trg + self.dropout(_trg)) # (B, Nkv, D)
 
         return trg, attention
 
@@ -417,7 +419,7 @@ class MultiHeadSlotAttention(nn.Module):
             attn_vis = attention.mean(1) # (B, N, K)
 
             # weighted mean
-            attention = attention + self.epsilon
+            attention = attention + self.epsilon 
             attention = attention / torch.sum(attention, dim=-2, keepdim=True)
             updates = torch.matmul(self.dropout(attention.permute(0, 1, 3, 2)), v) # (B, n_heads, K, head_dim)
             updates = updates.permute(0, 2, 1, 3).reshape(B, self.K, -1) # (B, K, D)
@@ -535,7 +537,6 @@ class ReconstructionDecoder(nn.Module):
             nn.Linear(D, D),
             nn.ReLU(),
             nn.Linear(D, 2),
-            nn.ReLU()
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

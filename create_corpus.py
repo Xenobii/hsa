@@ -68,7 +68,6 @@ def create_corpus(cfg: DictConfig):
                 group.create_dataset("spec", data=spec[i], compression="lzf")
 
                 group.attrs["wav_file"] = wav_file
-            break
         
         for idx in tqdm(valid_file_indices, desc="Creating validation corpus"):
             wav_file = valid_dataset[idx]
@@ -81,7 +80,6 @@ def create_corpus(cfg: DictConfig):
                 group.create_dataset("spec", data=spec[i], compression="lzf")
 
                 group.attrs["wav_file"] = wav_file
-            break
 
     print(f"Finished processing. Dataset saved at {f_out}")
             
