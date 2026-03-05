@@ -3,7 +3,7 @@ import torch.nn as nn
 import torchaudio
 import torch.nn.functional as func
 
-
+from model.utils import plot_spec
 
 class HSA(nn.Module):
     def __init__(
@@ -11,7 +11,7 @@ class HSA(nn.Module):
             F: int = 256,
             P: int = 32,
             T: int = 128,
-            D: int = 128,
+            D: int = 256,
             K: int = 8,
             target_sr: int = 16000,
             fft_bins: int = 2048,
@@ -39,6 +39,7 @@ class HSA(nn.Module):
             norm="slaney"
         )
         self.log_offset = log_offset
+        self.to_db = torchaudio.transforms.AmplitudeToDB(stype="power", top_db=80.0)
 
         # --- windowing --- 
         self.P = P
@@ -82,14 +83,19 @@ class HSA(nn.Module):
 
         # resample
         if sr != self.default_sr:
-            resampler = torchaudio.transforms.Resample(sr, self.target_sr)
+            resampler = torchaudio.transforms.Resample(sr, self.target_sr).to(wave_mono.device)
         else: 
             resampler = self.resampler
         wave_mono_16k = resampler(wave_mono)
         
         # log mel spec
         mel_spec = self.to_mel(wave_mono_16k)
-        log_mel_spec = torch.log(mel_spec + self.log_offset)
+        log_mel_spec = self.to_db(mel_spec)
+
+        # normalize
+        log_mel_spec = torch.clamp(log_mel_spec, min=-80.0, max=0.0)
+        log_mel_spec = (log_mel_spec + 80.0) / 80.0
+
         return log_mel_spec # (F, L)
     
 
@@ -128,7 +134,7 @@ class HSA(nn.Module):
             spec_rec_sequence = []
             num_chunks = chunked_spec.shape[0]
             for i in range(num_chunks):
-                spec_rec = self.forward(chunked_spec[i, :, :].unsqueeze(0)).squeeze(0) # (T, F)
+                spec_rec = self.forward(chunked_spec[i, :, :].unsqueeze(0)) # (1, T, F)
                 spec_rec_sequence.append(spec_rec)
             chunked_spec_rec = torch.cat(spec_rec_sequence, dim=0) # (B, T, F)
 
@@ -155,13 +161,13 @@ class HSA(nn.Module):
         return self.reconstruction_loss(chunked_spec_rec, chunked_spec)
     
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T + 2*P, F)
-        B = x.shape[0]
+    def forward(self, spec: torch.Tensor) -> torch.Tensor:
+        # spec: (B, T + 2*P, F)
+        B = spec.shape[0]
         T, F, M, K = self.T, self.F, self.M, self.K        
         
         # convert to frames
-        x = x.permute(0, 2, 1).contiguous() # (B, F, T + 2*P)
+        x = spec.permute(0, 2, 1).contiguous() # (B, F, T + 2*P)
         x = x.unfold(dimension=-1, size=self.M, step=1).permute(0, 2, 1, 3).contiguous() # (B, T, F, M)
 
         # 1d cnn
@@ -193,7 +199,8 @@ class HSA(nn.Module):
         reconstruction = torch.sum(masks_rec * specs_rec, dim=1) # (B, T, F)
 
         return reconstruction
-    
+
+
     def print_num_params(self) -> None:
         names = [
             ("conv", getattr(self, "conv", None)),
@@ -406,10 +413,8 @@ class MultiHeadSlotAttention(nn.Module):
             q = self.Wq(slots).view(B, -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3).contiguous() # (B, n_heads, K, head_dim)
             attn_logits = torch.matmul(k, q.permute(0, 1, 3, 2)) # (B, n_heads, N, K)
 
-            attention = func.softmax(
-                attn_logits.permute(0, 2, 1, 3).reshape(B, self.N, self.n_heads*self.K), dim=-1
-            ).view(B, self.N, self.n_heads, self.K).permute(0, 2, 1, 3) # (B, n_heads, N, K)
-            attn_vis = attention.sum(1) # (B, N, K)
+            attention = func.softmax(attn_logits, dim=-1) # (B, n_heads, N, K)
+            attn_vis = attention.mean(1) # (B, N, K)
 
             # weighted mean
             attention = attention + self.epsilon
@@ -529,7 +534,8 @@ class ReconstructionDecoder(nn.Module):
             nn.LayerNorm(D),
             nn.Linear(D, D),
             nn.ReLU(),
-            nn.Linear(D, 2)
+            nn.Linear(D, 2),
+            nn.ReLU()
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
