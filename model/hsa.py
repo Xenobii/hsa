@@ -2,30 +2,33 @@ import torch
 import torch.nn as nn
 import torchaudio
 import torch.nn.functional as func
+import numpy as np
+from nnAudio.features import CQT2010v2
+
 
 
 # === MODEL ===
 class HSA(nn.Module):
     def __init__(
             self,
-            F: int = 256,
-            P: int = 32,
-            T: int = 128,
-            D: int = 256,
-            K: int = 8,
-            target_sr: int = 16000,
+            F: int,
+            P: int,
+            T: int,
+            D: int,
+            K: int,
+            target_sr: int = 22050,
             fft_bins: int = 2048,
-            window_length: int = 2048,
             hop_sample: int = 256,
-            pad_mode: str = "constant",
-            log_offset: float = 1e-8,
+            bins_per_octave: int = 36,
             weight_a: float = 0.5,
             weight_b: float = 0.5,
+            **kwargs
     ) -> None:
         super().__init__()
         self.F = F
         self.weight_a = weight_a
         self.weight_b = weight_b
+        self.weight_chroma = 1.0
 
         # --- resampler ---
         self.target_sr = target_sr
@@ -36,14 +39,26 @@ class HSA(nn.Module):
         self.to_mel = torchaudio.transforms.MelSpectrogram(
             sample_rate=target_sr,
             n_fft=fft_bins,
-            win_length=window_length,
+            win_length=2048,
             hop_length=hop_sample,
-            pad_mode=pad_mode,
+            pad_mode="constant",
             n_mels=F,
             norm="slaney"
         )
-        self.log_offset = log_offset
-        self.to_db = torchaudio.transforms.AmplitudeToDB(stype="power", top_db=80.0)
+        self.log_offset = -80
+        self.to_db = torchaudio.transforms.AmplitudeToDB(top_db=80.0)
+
+        # --- cqt ---
+        self.to_cqt = CQT2010v2(
+            sr=target_sr,
+            hop_length=hop_sample,
+            bins_per_octave=bins_per_octave,
+            n_bins=F,
+            fmin=20.6,
+            pad_mode="constant",
+            verbose=False,
+        )
+        self.bins_per_octave = bins_per_octave
 
         # --- windowing --- 
         self.P = P
@@ -72,7 +87,19 @@ class HSA(nn.Module):
 
         # --- reconstruction decoder ---
         self.rec_dec = ReconstructionDecoder(F, D)
-        self.cnn_smooth = nn.Conv2d(2*K, 2*K, kernel_size=(1, 3), padding='same')
+        self.cnn_smooth = nn.Conv2d(2*K, 2*K, kernel_size=(3, 1), padding='same')
+
+        # --- chroma ---
+        chroma_matrix = self._build_chroma_matrix()
+        self.chroma_proj = nn.Linear(F, 12, bias=False)
+        self.chroma_proj.weight.data = chroma_matrix.clone().detach()
+        self.chroma_proj.weight.requires_grad = False
+
+        # --- tonnetz ---
+        tonnetz_matrix = self._build_tonnetz_matrix()
+        self.tonnetz_proj = nn.Linear(12, 6, bias=False)
+        self.tonnetz_proj.weight.data = tonnetz_matrix.clone().detach()
+        self.tonnetz_proj.weight.requires_grad = False
 
 
     def preprocess_input(self, wav_file: str) -> torch.Tensor:
@@ -95,15 +122,11 @@ class HSA(nn.Module):
             resampler = self.resampler
         wave_mono_16k = resampler(wave_mono)
         
-        # log mel spec
-        mel_spec = self.to_mel(wave_mono_16k)
-        log_mel_spec = self.to_db(mel_spec)
+        # log_cqt spec
+        spec = self.to_cqt(wave_mono_16k).squeeze(0)
+        log_spec = self.to_db(spec)
 
-        # normalize
-        log_mel_spec = torch.clamp(log_mel_spec, min=-80.0, max=0.0)
-        log_mel_spec = (log_mel_spec + 80.0) / 80.0
-
-        return log_mel_spec # (F, L)
+        return log_spec # (F, L)
     
 
     def _chunk_spec(self, spec: torch.Tensor) -> torch.Tensor:
@@ -122,15 +145,46 @@ class HSA(nn.Module):
         # spec_chunked: (chunks, T + 2*P, F)
 
         return spec_chunked
-    
 
+    
+    def _build_chroma_matrix(self) -> torch.Tensor:
+        bins_per_pitch = self.bins_per_octave // 12
+        n_bins = self.F
+
+        P = torch.zeros((12, n_bins))
+
+        for i in range(n_bins):
+            pitch_class = (i // bins_per_pitch) % 12
+            P[pitch_class, i] = 1 / bins_per_pitch
+
+        return P
+    
+    def _build_tonnetz_matrix(self) -> torch.Tensor:
+        M = torch.zeros((6, 12))
+
+        for k in range(12):
+            M[0, k] = np.cos(7*np.pi*k/6)
+            M[1, k] = np.sin(7*np.pi*k/6)
+            
+            M[2, k] = np.cos(3*np.pi*k/2)
+            M[3, k] = np.sin(3*np.pi*k/2)
+            
+            M[4, k] = np.cos(2*np.pi*k/3)
+            M[5, k] = np.sin(2*np.pi*k/3)
+        
+        return M
+    
     def inference(self, wav_file: str) -> None:
         with torch.no_grad():
             # preprocess
             chunked_spec = self.preprocess_input(wav_file) # (B, T+2P, F)
 
             # forward
-            rec_a, rec_b, masks_a, masks_b = self.forward(chunked_spec) # (B, T, F)
+            specs_a, specs_b, masks_a, masks_b = self.forward(chunked_spec) # (B, 2*K, T, F)
+
+            # reconstruction
+            rec_a = torch.sum(masks_a * specs_a, dim=1) # (B, T, F)
+            rec_b = torch.sum(masks_b * specs_b, dim=1) # (B, T, F)
 
         return rec_a, rec_b, masks_a, masks_b
             
@@ -140,26 +194,31 @@ class HSA(nn.Module):
             # preprocess
             chunked_spec = self.preprocess_input(wav_file) # (B, T+2P, F)
 
-            rec_a_sequence = []
-            rec_b_sequence = []
-            masks_a_sequence = []
-            masks_b_sequence = []
+            specs_a_seq = []
+            specs_b_seq = []
+            masks_a_seq = []
+            masks_b_seq = []
 
             # forward
             num_chunks = chunked_spec.shape[0]
             for i in range(num_chunks):
-                rec_a, rec_b, masks_a, masks_b = self.forward(chunked_spec[i, :, :].unsqueeze(0))
-                rec_a_sequence.append(rec_a)
-                rec_b_sequence.append(rec_b)
-                masks_a_sequence.append(masks_a)
-                masks_b_sequence.append(masks_b)
-                
-            rec_a = torch.cat(rec_a_sequence, dim=0) # (B, T, F)
-            rec_b = torch.cat(rec_b_sequence, dim=0) # (B, T, F)
-            masks_a = torch.cat(masks_a_sequence, dim=0) # (B, K, T, F)
-            masks_b = torch.cat(masks_b_sequence, dim=0) # (B, K, T, F)
+                specs_a, specs_b, masks_a, masks_b = self.forward(chunked_spec[i, :, :].unsqueeze(0))
+                specs_a_seq.append(specs_a) # (1, K, T, F)
+                specs_b_seq.append(specs_b) # (1, K, T, F)
+                masks_a_seq.append(masks_a) # (1, K, T, F)
+                masks_b_seq.append(masks_b) # (1, K, T, F)
+            
+            # concat chunks
+            specs_a_cat = torch.cat(specs_a_seq, dim=0) # (B, K, T, F)
+            specs_b_cat = torch.cat(specs_b_seq, dim=0) # (B, K, T, F)
+            masks_a_cat = torch.cat(masks_a_seq, dim=0) # (B, K, T, F)
+            masks_b_cat = torch.cat(masks_b_seq, dim=0) # (B, K, T, F)
 
-        return rec_a, rec_b, masks_a, masks_b
+            # reconstruction
+            rec_a = torch.sum(masks_a_cat * specs_a_cat, dim=1) # (B, T, F)
+            rec_b = torch.sum(masks_b_cat * specs_b_cat, dim=1) # (B, T, F)
+
+        return rec_a, rec_b, masks_a_cat, masks_b_cat
     
 
     def reconstruction_loss(self, estimate: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -174,14 +233,62 @@ class HSA(nn.Module):
 
         # sum across frequency, mean across time/batch
         return reconstruction_loss.mean()
+    
+
+    def tonnetz_loss(self, reconstructed_slots: torch.Tensor) -> torch.Tensor:
+        # (B, K, T, F)
+        device = reconstructed_slots.device
+        B = reconstructed_slots.shape[0]
+        K, T = self.K, self.T
+        
+        # chroma
+        chroma = self.chroma_proj(reconstructed_slots) # (B, K, T, 12)
+        chroma = chroma / (chroma.sum(dim=-1, keepdim=True) + 1e-8)
+
+        # tonnetz
+        tonnetz = self.tonnetz_proj(chroma) # (B, K, T, 6)
+        tonnetz = func.normalize(tonnetz, dim=-1)
+
+        # reshape
+        tonnetz = tonnetz.permute(0, 2, 1, 3).reshape(B*T, K, 6) # (B*T, K, 6)
+
+        # calculate similarity
+        sim = torch.matmul(tonnetz, tonnetz.transpose(1, 2)) # (B*T, K, K)
+        
+        # remove self similarity
+        mask = 1 - torch.eye(K, device=device)
+        sim = sim * mask.unsqueeze(0)
+
+        # calculate loss
+        loss = (sim ** 2).mean()
+
+        return loss
 
 
     def forward_train(self, chunked_spec: torch.Tensor) -> None:
-        # chunked_spec: (B, T+2P, F)
-        reconstruction_a, reconstruction_b, _, _ = self.forward(chunked_spec) # (B, T, F)
-        loss_a = self.reconstruction_loss(reconstruction_a, chunked_spec)
-        loss_b = self.reconstruction_loss(reconstruction_b, chunked_spec)
-        return self.weight_a*loss_a + self.weight_b*loss_b
+        specs_a, specs_b, masks_a, masks_b = self.forward(chunked_spec) # (B, K, T, F)
+
+        # reconstruction a
+        rec_slots_a = masks_a * specs_a # (B, K, T, F)
+        rec_a = torch.sum(rec_slots_a, dim=1) # (B, T, F)
+        
+        # reconstruction b
+        rec_slots_b = masks_b * specs_b # (B, K, T, F)
+        rec_b = torch.sum(rec_slots_b, dim=1) # (B, T, F)
+        
+        # reconstruction loss
+        loss_rec_a = self.reconstruction_loss(rec_a, chunked_spec)
+        loss_rec_b = self.reconstruction_loss(rec_b, chunked_spec)
+        
+        # chroma loss
+        loss_chroma_a = self.tonnetz_loss(rec_slots_a)
+        loss_chroma_b = self.tonnetz_loss(rec_slots_b)
+
+        # loss weighting
+        rec_loss = self.weight_a*loss_rec_a + self.weight_b*loss_rec_b
+        chroma_loss = self.weight_a*loss_chroma_a + self.weight_b*loss_chroma_b
+
+        return rec_loss + self.weight_chroma * chroma_loss
     
     
     def forward(self, spec: torch.Tensor) -> torch.Tensor:
@@ -217,25 +324,18 @@ class HSA(nn.Module):
         output_b = self.rec_dec(slots_b) # (N*T, K, F, 2)
 
         # smooth output
-        output_a = output_a.reshape(B, T, K, F, 2).permute(0, 2, 4, 3, 1).reshape(B, 2*K, F, T) # (B, K*2, F, T)
-        output_a = self.cnn_smooth(output_a) # (B, K*2, F, T)
-        output_b = output_b.reshape(B, T, K, F, 2).permute(0, 2, 4, 3, 1).reshape(B, 2*K, F, T) # (B, K*2, F, T)
-        output_b = self.cnn_smooth(output_b) # (B, K*2, F, T)
+        output_a = output_a.reshape(B, T, K, F, 2).permute(0, 2, 4, 1, 3).reshape(B, 2*K, T, F) # (B, K*2, T, F)
+        output_a = self.cnn_smooth(output_a).reshape(B, K, 2, T, F) # (B, K, 2, T, F)
+        output_b = output_b.reshape(B, T, K, F, 2).permute(0, 2, 4, 1, 3).reshape(B, 2*K, T, F) # (B, K*2, T, F)
+        output_b = self.cnn_smooth(output_b).reshape(B, K, 2, T, F) # (B, K, 2, T, F)
+
+        # reconstruction components
+        specs_a = output_a[:, :, 0, :, :] # (B, K, T, F) 
+        masks_a = func.softmax(output_a[:, :, 1, :, :], dim=1) # (B, K, T, F)
+        specs_b = output_b[:, :, 0, :, :] # (B, K, T, F) 
+        masks_b = func.softmax(output_b[:, :, 1, :, :], dim=1) # (B, K, T, F)
         
-        # reconstruction
-        output_a = output_a.reshape(B, K, 2, F, T).permute(0, 1, 2, 4, 3) # (B, K, 2, T, F)
-        specs_rec_a = output_a[:, :, 0, :, :] # (B, K, T, F) 
-        masks_rec_a = output_a[:, :, 1, :, :] # (B, K, T, F)
-        masks_rec_a = func.softmax(masks_rec_a, dim=1) # (B, K, T, F)
-        reconstruction_a = torch.sum(masks_rec_a * specs_rec_a, dim=1) # (B, T, F)
-        
-        output_b = output_b.reshape(B, K, 2, F, T).permute(0, 1, 2, 4, 3) # (B, K, 2, T, F)
-        specs_rec_b = output_b[:, :, 0, :, :] # (B, K, T, F) 
-        masks_rec_b = output_b[:, :, 1, :, :] # (B, K, T, F)
-        masks_rec_b = func.softmax(masks_rec_b, dim=1) # (B, K, T, F)
-        reconstruction_b = torch.sum(masks_rec_b * specs_rec_b, dim=1) # (B, T, F)
-        
-        return reconstruction_a, reconstruction_b, masks_rec_a, masks_rec_b
+        return specs_a, specs_b, masks_a, masks_b
     
 
     def print_num_params(self) -> None:

@@ -9,7 +9,7 @@ import torch
 
 
 def load_checkpoint():
-    ckpt_path = Path("./checkpoints/model.pt")
+    ckpt_path = Path("./checkpoints/epoch_1/model.pt")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     return ckpt
 

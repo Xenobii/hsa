@@ -64,7 +64,6 @@ def plot_spec(*args, k=0, cmap="magma", save_path=None):
         plt.show()
 
 
-    
 def visualize_slots(
             spec_rec: torch.Tensor,
             masks_rec: torch.Tensor,
@@ -73,23 +72,24 @@ def visualize_slots(
     ) -> None: 
         # spec_rec (B, T, F)
         # masks_rec (B, K, T, F)
-        spec_rec = spec_rec[k, :, :, :] # (T, F)
+        spec_rec = spec_rec[k, :, :] # (T, F)
         masks_rec = masks_rec[k, :, :, :] # (K, T, F)
         
         # hard slot map
-        slot_map = torch.argmax(masks_rec, dim=1) # (T, F)
+        slot_map = torch.argmax(masks_rec, dim=0) # (T, F)
         K = masks_rec.shape[0]
         
-        slot_colors = plt.cm.tab10(np.linspace(0, 1, K))[:, :3]
-        seg = slot_colors[slot_map] # (T, F, 3)
+        cmap = plt.cm.get_cmap("Set3", K) 
+        colors = cmap(np.arange(K))[:, :3] 
+        seg = colors[slot_map] # (T, F, 3)
         
         spec_rgb = np.stack([spec_rec]*3, axis=-1) # (T, F, 3)
         overlay = 0.6*spec_rgb + 0.4*seg
 
-        plt.imshow(overlay.permute(), origin="lower")
+        plt.imshow(overlay.transpose(1, 0, 2), origin="lower")
             
         if save_path:
             plt.savefig(save_path)
             plt.close()
         else:
-            plt.show()
+            plt.show()    

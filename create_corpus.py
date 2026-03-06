@@ -7,7 +7,7 @@ from tqdm import tqdm
 from typing import List
 from omegaconf import DictConfig
 from torch.utils.data import Dataset
-from model.hsa import HSA
+from hydra.utils import instantiate
 
 
 
@@ -45,7 +45,7 @@ def create_corpus(cfg: DictConfig):
     valid_dataset = MaestroDataset(root=cfg.corpus.root, split="validation")
 
     # --- model ---
-    model = HSA()
+    model = instantiate(cfg.model)
 
     with h5py.File(f_out, "w") as h5:
         print(f"Creating corpus...")
