@@ -147,6 +147,14 @@ class HSA(nn.Module):
         # spec_chunked: (chunks, T + 2*P, F)
 
         return spec_chunked
+    
+
+    def db_to_power(self, x: torch.Tensor) -> torch.Tensor:
+        return func.relu(torch.pow(10.0, x / 80.0))
+    
+
+    def power_to_db(self, x: torch.Tensor) -> torch.Tensor:
+        return 80.0 * torch.log10(x.clamp(min=1e-8))
 
     
     def _build_chroma_matrix(self) -> torch.Tensor:
@@ -190,6 +198,10 @@ class HSA(nn.Module):
             rec_a = torch.sum(masks_a * specs_a, dim=1) # (B, T, F)
             rec_b = torch.sum(masks_b * specs_b, dim=1) # (B, T, F)
 
+            # to log
+            rec_a = self.power_to_db(rec_a) # (B, T, F)
+            rec_b = self.power_to_db(rec_b) # (B, T, F)
+
         return rec_a, rec_b, masks_a, masks_b
             
 
@@ -213,16 +225,20 @@ class HSA(nn.Module):
                 masks_b_seq.append(masks_b) # (1, K, T, F)
             
             # concat chunks
-            specs_a_cat = torch.cat(specs_a_seq, dim=0) # (B, K, T, F)
-            specs_b_cat = torch.cat(specs_b_seq, dim=0) # (B, K, T, F)
-            masks_a_cat = torch.cat(masks_a_seq, dim=0) # (B, K, T, F)
-            masks_b_cat = torch.cat(masks_b_seq, dim=0) # (B, K, T, F)
+            specs_a = torch.cat(specs_a_seq, dim=0) # (B, K, T, F)
+            specs_b = torch.cat(specs_b_seq, dim=0) # (B, K, T, F)
+            masks_a = torch.cat(masks_a_seq, dim=0) # (B, K, T, F)
+            masks_b = torch.cat(masks_b_seq, dim=0) # (B, K, T, F)
 
             # reconstruction
-            rec_a = torch.sum(masks_a_cat * specs_a_cat, dim=1) # (B, T, F)
-            rec_b = torch.sum(masks_b_cat * specs_b_cat, dim=1) # (B, T, F)
+            rec_a = torch.sum(masks_a * specs_a, dim=1) # (B, T, F)
+            rec_b = torch.sum(masks_b * specs_b, dim=1) # (B, T, F)
 
-        return rec_a, rec_b, masks_a_cat, masks_b_cat
+            # log spectrogram
+            rec_a = self.power_to_db(rec_a) # (B, T, F)
+            rec_b = self.power_to_db(rec_b) # (B, T, F)
+
+        return rec_a, rec_b, masks_a, masks_b
     
 
     def reconstruction_loss(self, estimate: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -272,17 +288,17 @@ class HSA(nn.Module):
     def forward_train(self, chunked_spec: torch.Tensor) -> None:
         specs_a, specs_b, masks_a, masks_b = self.forward(chunked_spec) # (B, K, T, F)
 
-        # reconstruction a
-        rec_slots_a = torch.pow(10.0, specs_a / 80.0)
+        # mask
         rec_slots_a = masks_a * specs_a # (B, K, T, F)
-        rec_a = torch.sum(rec_slots_a, dim=1) # (B, T, F)
-        rec_a = 80.0 * torch.log10(rec_a.clamp(min=1e-8))
-        
-        # reconstruction b
-        rec_slots_b = torch.pow(10.0, specs_b / 80.0)
         rec_slots_b = masks_b * specs_b # (B, K, T, F)
+        
+        # reconstruction
+        rec_a = torch.sum(rec_slots_a, dim=1) # (B, T, F)
         rec_b = torch.sum(rec_slots_b, dim=1) # (B, T, F)
-        rec_b = 80.0 * torch.log10(rec_b.clamp(min=1e-8))
+        
+        # log spectrogram
+        rec_a = self.power_to_db(rec_a) # (B, T, F)
+        rec_b = self.power_to_db(rec_b) # (B, T, F)
         
         # reconstruction loss
         loss_rec_a = self.reconstruction_loss(rec_a, chunked_spec)
@@ -293,7 +309,7 @@ class HSA(nn.Module):
         loss_chroma_b = self.tonnetz_loss(rec_slots_b)
 
         # loss weighting
-        rec_loss = self.weight_a*loss_rec_a + self.weight_b*loss_rec_b
+        rec_loss    = self.weight_a*loss_rec_a + self.weight_b*loss_rec_b
         chroma_loss = self.weight_a*loss_chroma_a + self.weight_b*loss_chroma_b
 
         return (1 - self.weight_chroma) * rec_loss + self.weight_chroma * chroma_loss
@@ -333,16 +349,16 @@ class HSA(nn.Module):
 
         # smooth output
         output_a = output_a.reshape(B, T, K, F, 2).permute(0, 2, 4, 1, 3).reshape(B, 2*K, T, F) # (B, K*2, T, F)
-        output_a = self.cnn_smooth(output_a).reshape(B, K, 2, T, F) # (B, K, 2, T, F)
         output_b = output_b.reshape(B, T, K, F, 2).permute(0, 2, 4, 1, 3).reshape(B, 2*K, T, F) # (B, K*2, T, F)
+        output_a = self.cnn_smooth(output_a).reshape(B, K, 2, T, F) # (B, K, 2, T, F)
         output_b = self.cnn_smooth(output_b).reshape(B, K, 2, T, F) # (B, K, 2, T, F)
 
-        # reconstruction components
-        specs_a = output_a[:, :, 0, :, :] # (B, K, T, F) 
+        # reconstruction 
+        specs_a = self.db_to_power(output_a[:, :, 0, :, :]) # (, K, T, F)
+        specs_b = self.db_to_power(output_b[:, :, 0, :, :]) # (B, K, T, F)
         masks_a = func.softmax(output_a[:, :, 1, :, :], dim=1) # (B, K, T, F)
-        specs_b = output_b[:, :, 0, :, :] # (B, K, T, F) 
         masks_b = func.softmax(output_b[:, :, 1, :, :], dim=1) # (B, K, T, F)
-        
+
         return specs_a, specs_b, masks_a, masks_b
     
 
