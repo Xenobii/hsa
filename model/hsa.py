@@ -22,6 +22,7 @@ class HSA(nn.Module):
             bins_per_octave: int = 36,
             weight_a: float = 0.5,
             weight_b: float = 0.5,
+            weight_chroma: float = 0.2,
             **kwargs
     ) -> None:
         super().__init__()
@@ -288,7 +289,7 @@ class HSA(nn.Module):
         rec_loss = self.weight_a*loss_rec_a + self.weight_b*loss_rec_b
         chroma_loss = self.weight_a*loss_chroma_a + self.weight_b*loss_chroma_b
 
-        return rec_loss + self.weight_chroma * chroma_loss
+        return (1 - self.weight_chroma) * rec_loss + self.weight_chroma * chroma_loss
     
     
     def forward(self, spec: torch.Tensor) -> torch.Tensor:

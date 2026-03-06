@@ -15,6 +15,7 @@ model:
   bins_per_octave: 36
   weight_a: 0.5
   weight_b: 0.5
+  weight_chroma: 0.2
 
 dataloader:
   _target_: torch.utils.data.DataLoader
