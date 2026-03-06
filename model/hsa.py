@@ -6,6 +6,7 @@ import numpy as np
 from nnAudio.features import CQT2010v2
 
 
+from model.utils import plot_spec
 
 # === MODEL ===
 class HSA(nn.Module):
@@ -29,7 +30,7 @@ class HSA(nn.Module):
         self.F = F
         self.weight_a = weight_a
         self.weight_b = weight_b
-        self.weight_chroma = 1.0
+        self.weight_chroma = weight_chroma
 
         # --- resampler ---
         self.target_sr = target_sr
@@ -159,7 +160,8 @@ class HSA(nn.Module):
             P[pitch_class, i] = 1 / bins_per_pitch
 
         return P
-    
+
+
     def _build_tonnetz_matrix(self) -> torch.Tensor:
         M = torch.zeros((6, 12))
 
@@ -174,7 +176,8 @@ class HSA(nn.Module):
             M[5, k] = np.sin(2*np.pi*k/3)
         
         return M
-    
+
+
     def inference(self, wav_file: str) -> None:
         with torch.no_grad():
             # preprocess
@@ -270,12 +273,16 @@ class HSA(nn.Module):
         specs_a, specs_b, masks_a, masks_b = self.forward(chunked_spec) # (B, K, T, F)
 
         # reconstruction a
+        rec_slots_a = torch.pow(10.0, rec_slots_a / 80.0)
         rec_slots_a = masks_a * specs_a # (B, K, T, F)
         rec_a = torch.sum(rec_slots_a, dim=1) # (B, T, F)
+        rec_a = 80.0 * torch.log10(rec_a)
         
         # reconstruction b
+        rec_slots_b = torch.pow(10.0, rec_slots_b / 80.0)
         rec_slots_b = masks_b * specs_b # (B, K, T, F)
         rec_b = torch.sum(rec_slots_b, dim=1) # (B, T, F)
+        rec_b = 80.0 * torch.log10(rec_b)
         
         # reconstruction loss
         loss_rec_a = self.reconstruction_loss(rec_a, chunked_spec)
