@@ -273,13 +273,13 @@ class HSA(nn.Module):
         specs_a, specs_b, masks_a, masks_b = self.forward(chunked_spec) # (B, K, T, F)
 
         # reconstruction a
-        rec_slots_a = torch.pow(10.0, rec_slots_a / 80.0)
+        rec_slots_a = torch.pow(10.0, specs_a / 80.0)
         rec_slots_a = masks_a * specs_a # (B, K, T, F)
         rec_a = torch.sum(rec_slots_a, dim=1) # (B, T, F)
         rec_a = 80.0 * torch.log10(rec_a)
         
         # reconstruction b
-        rec_slots_b = torch.pow(10.0, rec_slots_b / 80.0)
+        rec_slots_b = torch.pow(10.0, specs_b / 80.0)
         rec_slots_b = masks_b * specs_b # (B, K, T, F)
         rec_b = torch.sum(rec_slots_b, dim=1) # (B, T, F)
         rec_b = 80.0 * torch.log10(rec_b)
