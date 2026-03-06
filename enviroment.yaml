@@ -1,0 +1,25 @@
+name: hsa
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - pytorch>=2.7
+  - torchaudio
+  - pytorch-cuda=12.8
+  - pip
+
+  - pip:
+      - pretty_midi
+      - mir_eval
+      - resampy
+      - nnaudio
+      - hydra-core
+      - pandas
+      - omegaconf
+      - tqdm
+      - matplotlib
+      - h5py
