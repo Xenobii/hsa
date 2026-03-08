@@ -217,7 +217,7 @@ class HSA(nn.Module):
 
             # forward
             num_chunks = chunked_spec.shape[0]
-            for i in range(num_chunks):
+            for i in range(4):
                 specs_a, specs_b, masks_a, masks_b = self.forward(chunked_spec[i, :, :].unsqueeze(0))
                 specs_a_seq.append(specs_a) # (1, K, T, F)
                 specs_b_seq.append(specs_b) # (1, K, T, F)
@@ -248,32 +248,42 @@ class HSA(nn.Module):
         # crop target
         target = target[:, self.P:-self.P, :] # (B, T, F)
 
+        # also compute power loss
+        target_power = self.db_to_power(target)
+        estimate_power = self.db_to_power(estimate)
+
         # calculate loss
-        reconstruction_loss = func.mse_loss(estimate, target, reduction="none")
+        reconstruction_loss = \
+            0.1 * func.mse_loss(estimate_power, target_power, reduction="mean") + \
+            func.l1_loss(estimate, target, reduction="mean")
 
         # sum across frequency, mean across time/batch
-        return reconstruction_loss.mean()
+        return reconstruction_loss
     
 
     def tonnetz_loss(self, reconstructed_slots: torch.Tensor) -> torch.Tensor:
+        """
+        Input: Power spectrograms of the reconstructed slots
+        """
         # (B, K, T, F)
         device = reconstructed_slots.device
         B = reconstructed_slots.shape[0]
         K, T = self.K, self.T
         
-        # chroma
+        # power chroma
         chroma = self.chroma_proj(reconstructed_slots) # (B, K, T, 12)
         chroma = chroma / (chroma.sum(dim=-1, keepdim=True) + 1e-8)
+        chroma = chroma.permute(0, 2, 1, 3).reshape(B*T, K, 12) # (B*T, K, 6)
 
         # tonnetz
-        tonnetz = self.tonnetz_proj(chroma) # (B, K, T, 6)
-        tonnetz = func.normalize(tonnetz, dim=-1)
+        # tonnetz = self.tonnetz_proj(chroma) # (B, K, T, 6)
+        # tonnetz = func.normalize(tonnetz, dim=-1)
 
-        # reshape
-        tonnetz = tonnetz.permute(0, 2, 1, 3).reshape(B*T, K, 6) # (B*T, K, 6)
+        # # reshape
+        # tonnetz = tonnetz.permute(0, 2, 1, 3).reshape(B*T, K, 6) # (B*T, K, 6)
 
         # calculate similarity
-        sim = torch.matmul(tonnetz, tonnetz.transpose(1, 2)) # (B*T, K, K)
+        sim = torch.matmul(chroma, chroma.transpose(1, 2)) # (B*T, K, K)
         
         # remove self similarity
         mask = 1 - torch.eye(K, device=device)
@@ -312,7 +322,7 @@ class HSA(nn.Module):
         rec_loss    = self.weight_a*loss_rec_a + self.weight_b*loss_rec_b
         chroma_loss = self.weight_a*loss_chroma_a + self.weight_b*loss_chroma_b
 
-        return (1 - self.weight_chroma) * rec_loss + self.weight_chroma * chroma_loss
+        return (1 - self.weight_chroma)*rec_loss + self.weight_chroma*chroma_loss
     
     
     def forward(self, spec: torch.Tensor) -> torch.Tensor:

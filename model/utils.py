@@ -63,33 +63,48 @@ def plot_spec(*args, k=0, cmap="magma", save_path=None):
     else:
         plt.show()
 
-
 def visualize_slots(
-            spec_rec: torch.Tensor,
-            masks_rec: torch.Tensor,
-            save_path: str = None,
-            k: int=0,
-    ) -> None: 
-        # spec_rec (B, T, F)
-        # masks_rec (B, K, T, F)
-        spec_rec = spec_rec[k, :, :] # (T, F)
-        masks_rec = masks_rec[k, :, :, :] # (K, T, F)
-        
-        # hard slot map
-        slot_map = torch.argmax(masks_rec, dim=0) # (T, F)
-        K = masks_rec.shape[0]
-        
-        cmap = plt.cm.get_cmap("Set3", K) 
-        colors = cmap(np.arange(K))[:, :3] 
-        seg = colors[slot_map] # (T, F, 3)
-        
-        spec_rgb = np.stack([spec_rec]*3, axis=-1) # (T, F, 3)
-        overlay = 0.6*spec_rgb + 0.4*seg
+        spec_rec: torch.Tensor,
+        masks_rec: torch.Tensor,
+        save_path: str = None,
+        k: int = 0,
+        db_min: float = -80.0,
+        db_max: float = 0.0,
+) -> None:
+    # spec_rec (B, T, F)
+    # masks_rec (B, K, T, F)
 
-        plt.imshow(overlay.transpose(1, 0, 2), origin="lower")
-            
-        if save_path:
-            plt.savefig(save_path)
-            plt.close()
-        else:
-            plt.show()    
+    spec = spec_rec[k].detach().cpu().numpy()      # (T, F)
+    masks = masks_rec[k].detach().cpu().numpy()    # (K, T, F)
+
+    # ----- normalize log-mel -----
+    spec = np.clip(spec, db_min, db_max)
+    spec = (spec - db_min) / (db_max - db_min)     # -> [0,1]
+
+    # ----- hard slot assignment -----
+    slot_map = np.argmax(masks, axis=0)            # (T, F)
+    K = masks.shape[0]
+
+    # ----- slot colors -----
+    cmap = plt.cm.get_cmap("Set3", K)
+    colors = cmap(np.arange(K))[:, :3]
+
+    seg = colors[slot_map]                         # (T, F, 3)
+
+    # ----- spectrogram visualization -----
+    # use perceptual map for spectrogram
+    spec_rgb = plt.cm.magma(spec)[..., :3]         # (T, F, 3)
+
+    # overlay
+    overlay = 0.1 * spec_rgb + 0.9 * seg
+
+    plt.figure(figsize=(10,4))
+    plt.imshow(overlay.transpose(1,0,2), origin="lower", aspect="auto")
+    plt.xlabel("Time")
+    plt.ylabel("Mel bin")
+
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight", dpi=200)
+        plt.close()
+    else:
+        plt.show()

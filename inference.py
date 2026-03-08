@@ -9,7 +9,7 @@ import torch
 
 
 def load_checkpoint():
-    ckpt_path = Path("./checkpoints/epoch_1/model.pt")
+    ckpt_path = Path("./checkpoints/epoch_5/model.pt")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     return ckpt
 
@@ -25,12 +25,13 @@ def inference(cfg: DictConfig):
     model.eval()
 
     # -- inference ---
+    original_rec = model.preprocess_input("test/test_wav.WAV")
     rec_a, rec_b, masks_a, masks_b = model.sequential_inference("test/test_wav.WAV")    
     
     # --- plot ---
-    plot_spec(rec_a, rec_b, k=0, save_path="test/test.png")
-    visualize_slots(rec_a, masks_a, save_path="test/slot_test.png")
-    visualize_slots(rec_b, masks_b, save_path="test/slot_test.png")
+    plot_spec(original_rec, rec_a, rec_b, k=2, save_path="test/test.png")
+    # visualize_slots(rec_a, masks_a, save_path="test/slot_test.png", k=0)
+    visualize_slots(rec_b, masks_b, save_path="test/slot_test.png", k=2)
     
     print("--- Inference successful! ---")
 

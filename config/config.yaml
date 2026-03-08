@@ -24,8 +24,8 @@ dataloader:
   num_workers: ${train.num_workers}
 
 train:
-  epochs: 12
-  batch_size: 6
+  epochs: 50
+  batch_size: 7
   shuffle: True
   num_workers: 2
   warmup_steps: 4000
