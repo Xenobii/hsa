@@ -44,7 +44,7 @@ class Corpus(Dataset):
 
 
 class Trainer():
-    def __init__(self, cfg: DictConfig, load_epoch: Optional[int]):
+    def __init__(self, cfg: DictConfig, load_epoch: Optional[int] = None):
         # --- torch ---
         self.configure_torch(cfg.torch)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -93,7 +93,9 @@ class Trainer():
     
 
     def save_run(self, loss: dict, epoch: int) -> None:
-        epoch_dir = Path("./checkpoints") / f"epoch_{epoch+1}"
+        run_dir = Path(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
+        # epoch_dir = Path("./checkpoints") / f"epoch_{epoch+1}"
+        epoch_dir = run_dir / f"epoch_{epoch+1}"
         epoch_dir.mkdir(parents=True, exist_ok=True)
 
         out_file_loss = epoch_dir / "loss.json"
@@ -124,9 +126,7 @@ class Trainer():
 
 
     def collate_fn(self, batch):
-        specs = batch
-        specs = torch.stack(specs, dim=0)
-        return specs
+        return torch.stack(batch, dim=0)
 
 
     def train(self) -> None:
@@ -149,7 +149,7 @@ class Trainer():
 
                 # init
                 self.optimizer.zero_grad(set_to_none=True)
-
+                
                 # forward
                 loss = self.model.forward_train(spec)
 
@@ -201,7 +201,7 @@ class Trainer():
                 valid_loss=avg_valid_loss,
             )
 
-            self.save_run(self.model, loss, epoch)
+            self.save_run(loss, epoch)
 
         print("Training complete!")
 

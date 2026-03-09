@@ -3,7 +3,7 @@ corpus:
   root: corpus/dataset/maestro
 
 model:
-  _target_: model.hsa.HSA
+  _target_: model.hsa_conv.HSA
   F: 324
   P: 32
   T: 128
@@ -25,7 +25,7 @@ dataloader:
 
 train:
   epochs: 50
-  batch_size: 7
+  batch_size: 1
   shuffle: True
   num_workers: 2
   warmup_steps: 4000
